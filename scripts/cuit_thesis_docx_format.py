@@ -370,6 +370,10 @@ def analyze_section_sequence(texts: list[str]) -> dict[str, object]:
     current = "cover"
     current_order = SECTION_ORDER[current]
     saw_nonempty = False
+    entered_modules: set[str] = {"cover"}
+
+    def module_name(region: str) -> str:
+        return "abstract" if region in {"abstract_zh", "abstract_en"} else region
 
     for index, text in enumerate(texts):
         text = text.strip()
@@ -401,6 +405,14 @@ def analyze_section_sequence(texts: list[str]) -> dict[str, object]:
                     f"但当前已经进入{SECTION_LABELS.get(current, current)}。"
                 )
             else:
+                if marker != current:
+                    marker_module = module_name(marker)
+                    if marker_module in entered_modules:
+                        warnings.append(
+                            f"组成部分疑似重复出现：段落 {index} 再次进入“{SECTION_LABELS.get(marker_module, marker_module)}”模块。"
+                        )
+                    else:
+                        entered_modules.add(marker_module)
                 current = marker
                 current_order = marker_order
         regions.append(current)
@@ -500,9 +512,9 @@ def classify_paragraph(text: str, in_body: bool, region: str = "front") -> str |
             return "toc_level3"
         if re.match(r"^\d+\.\d+\s+\S+", text):
             return "toc_level2"
-    if re.match(r"^\d+\.\d+\.\d+\s*\S+", text):
+    if region == "body" and re.match(r"^\d+\.\d+\.\d+\s*\S+", text):
         return "heading3"
-    if re.match(r"^\d+\.\d+\s*\S+", text):
+    if region == "body" and re.match(r"^\d+\.\d+\s*\S+", text):
         return "heading2"
     if re.match(r"^图\s*\d+[\.\-－]\d+\s*\S+", text):
         return "figure_caption"
@@ -1378,8 +1390,26 @@ def _section_matches(section) -> bool:
     )
 
 
+def _section_page_kinds(document: Document, regions: list[str]) -> list[str | None]:
+    kinds: list[str | None] = []
+    ranges = section_paragraph_ranges(document)
+    for section_idx, _section in enumerate(document.sections):
+        start, end = ranges[section_idx] if section_idx < len(ranges) else (0, -1)
+        section_regions = set(regions[start : end + 1]) if start <= end else set()
+        if {"abstract_zh", "abstract_en", "toc"} & section_regions:
+            kinds.append("front")
+        elif {"body", "references", "appendix", "acknowledgement"} & section_regions:
+            kinds.append("main")
+        else:
+            kinds.append(None)
+    return kinds
+
+
 def collect_section_issues(document: Document) -> list[Issue]:
     issues: list[Issue] = []
+    texts = [paragraph_text(paragraph) for paragraph in document.paragraphs]
+    regions = analyze_section_sequence(texts)["regions"]
+    section_page_kinds = _section_page_kinds(document, regions)
     header_start, header_reason = find_header_start_section(document)
     if header_reason == "not-found":
         rule = RULES["page_header"]
@@ -1443,7 +1473,8 @@ def collect_section_issues(document: Document) -> list[Issue]:
                     location=f"section {sec_idx} header",
                 )
             )
-        issues.extend(collect_page_number_issues(section, sec_idx))
+        page_kind = section_page_kinds[zero_idx] if zero_idx < len(section_page_kinds) else None
+        issues.extend(collect_page_number_issues(section, sec_idx, page_kind))
     return issues
 
 
@@ -1489,14 +1520,14 @@ def validate_main_page_number(fmt: str | None, visible_text: str, field_text: st
     return None
 
 
-def collect_page_number_issues(section, sec_idx: int) -> list[Issue]:
+def collect_page_number_issues(section, sec_idx: int, page_kind: str | None) -> list[Issue]:
     visible_text, field_text = _footer_field_info(section)
     if "PAGE" not in field_text.upper() and not visible_text:
         return []
+    if page_kind is None:
+        return []
     fmt, _start = _section_page_number_format(section)
-    compact = re.sub(r"\s+", "", visible_text)
-    is_main = bool(re.search(r"第.+页共.+页", compact)) or "NUMPAGES" in field_text.upper()
-    if is_main:
+    if page_kind == "main":
         problem = validate_main_page_number(fmt, visible_text, field_text)
         rule_key = "main_page_number"
     else:
